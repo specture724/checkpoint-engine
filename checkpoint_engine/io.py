@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from loguru import logger
 from pydantic import BaseModel
-from safetensors.torch import safe_open
+from safetensors import safe_open
 
 from checkpoint_engine.types import ParameterMeta
 
