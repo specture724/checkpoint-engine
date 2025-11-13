@@ -20,6 +20,7 @@ from loguru import logger
 from pydantic import BaseModel, PlainSerializer, PlainValidator, WithJsonSchema
 from torch.multiprocessing.reductions import reduce_tensor
 
+from checkpoint_engine.api import _init_api
 from checkpoint_engine.device_utils import DeviceManager, get_ip, npu_generate_uuid
 
 from checkpoint_engine.p2p_store import P2PStore, _get_master_port, _get_physical_gpu_id
@@ -27,35 +28,6 @@ from checkpoint_engine.types import *
 from checkpoint_engine.memory_layout import _align_size, _gen_h2d_buckets, _register_checkpoint, _to_named_tensor, _ALIGN_SIZE
 
 
-def request_inference_to_update(
-    url: str,
-    socket_paths: dict[str, str],
-    timeout: float = 300.0,
-    uds: str | None = None,
-):
-    """Send an inference update request to inference server via HTTP or Unix socket.
-
-    Args:
-        url (str): The HTTP URL or request path (e.g., "http://localhost:19730/inference") to send the request to.
-        socket_paths (dict[str, str]): A dictionary containing device uuid and IPC socket paths for updating weights.
-        timeout (float, optional): Request timeout in seconds. Defaults to 300.0.
-        uds (str, optional): Path to a Unix domain socket. If provided, the request
-            will be sent via the Unix socket instead of HTTP. Defaults to None.
-
-    Raises:
-        httpx.HTTPStatusError: If the response contains an HTTP error status.
-        httpx.RequestError: If there was an issue while making the request.
-    """
-    resp = httpx.Client(transport=httpx.HTTPTransport(uds=uds)).post(
-        url,
-        json={
-            "method": "update_weights_from_ipc",
-            "args": [socket_paths],
-            "timeout": timeout,
-        },
-        timeout=timeout,
-    )
-    resp.raise_for_status()
 
 
 def _get_bcast_rank_map(world_size: int, ranks: list[int] | None) -> dict[int, int]:
@@ -617,79 +589,5 @@ class ParameterServer:
         self.device_manager.device_module.empty_cache()
 
 
-def _init_api(ps: ParameterServer) -> Any:
-    import fastapi
-    from fastapi import Request
-    from fastapi.responses import JSONResponse, Response
-
-    app = fastapi.FastAPI()
-
-    class RegisterRequest(BaseModel):
-        files: list[str]
-
-    class UpdateRequest(BaseModel):
-        ranks: list[int] = []
-        update_url: str | None = None
-        inference_group_ranks: list[int] = []
-        timeout: float = 300.0
-        uds: str | None = None
-
-    def wrap_exception(func: Callable[[], None]) -> Response:
-        try:
-            func()
-        except Exception as e:  # noqa: BLE001
-            logger.exception(f"wrap exception {func} failed")
-            return JSONResponse(content=str(e), status_code=500)
-        return Response(status_code=200)
-
-    @app.post("/v1/checkpoints/{checkpoint_name}/files")
-    async def register_files(checkpoint_name: str, req: RegisterRequest, raw: Request) -> Response:
-        return wrap_exception(lambda: ps.register_checkpoint(checkpoint_name, files=req.files))
-
-    @app.delete("/v1/checkpoints/{checkpoint_name}")
-    async def unregister_checkpoint(checkpoint_name: str) -> Response:
-        return wrap_exception(lambda: ps.unregister_checkpoint(checkpoint_name))
-
-    @app.get("/v1/healthz")
-    async def healthz() -> Response:
-        return Response(status_code=200)
-
-    @app.post("/v1/checkpoints/{checkpoint_name}/gather-metas")
-    async def gather_metas(checkpoint_name: str) -> Response:
-        return wrap_exception(lambda: ps.gather_metas(checkpoint_name))
-
-    @app.post("/v1/checkpoints/{checkpoint_name}/update")
-    async def update(checkpoint_name: str, req: UpdateRequest) -> Response:
-        def update_func(socket_paths: list[tuple[str, str]]):
-            if req.update_url is None:
-                return
-            if req.inference_group_ranks:
-                socket_paths = [socket_paths[i] for i in req.inference_group_ranks]
-            request_inference_to_update(
-                req.update_url, dict(socket_paths), timeout=req.timeout, uds=req.uds
-            )
-
-        return wrap_exception(lambda: ps.update(checkpoint_name, update_func, ranks=req.ranks))
-
-    return app
 
 
-@logger.catch(reraise=True)
-def run_from_cli():
-    import uvicorn
-
-    parser = argparse.ArgumentParser(description="Parameter Server")
-    parser.add_argument("--uds", type=str)
-
-    args = parser.parse_args()
-    logger.info(
-        f"Parameter Server {args=}, master addr: {os.getenv('MASTER_ADDR')}, master port {os.getenv('MASTER_PORT')}"
-    )
-
-    assert args.uds and len(args.uds) > 0, args.uds
-    ps = ParameterServer(auto_pg=True)
-    uvicorn.run(_init_api(ps), uds=args.uds, timeout_keep_alive=60)
-
-
-if __name__ == "__main__":
-    run_from_cli()
