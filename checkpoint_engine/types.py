@@ -1,21 +1,7 @@
-from typing import TYPE_CHECKING, Annotated, Any, NamedTuple
+from typing import Annotated, Any, NamedTuple
+
 import torch
 from pydantic import BaseModel, PlainSerializer, PlainValidator, WithJsonSchema
-
-
-if TYPE_CHECKING:
-    from typing import TypeVar
-
-    from typing_extensions import TypedDict
-
-    class FileMeta(TypedDict):
-        key: str  # parameter name
-        dtype: torch.dtype
-        shape: torch.Size
-        type: type
-        tp_concat_dim: int
-
-    T = TypeVar("T")
 
 
 def _dt_validate(value: Any) -> torch.dtype:
@@ -106,5 +92,3 @@ class MemoryBufferMetaList(BaseModel):
 class DataToGather(MemoryBufferMetaList):
     host_ip: str
     device_uuid: str
-
-

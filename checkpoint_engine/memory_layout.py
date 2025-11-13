@@ -1,12 +1,26 @@
+from __future__ import annotations
+
 import concurrent.futures
 from collections import defaultdict
+from typing import TYPE_CHECKING, TypeVar
 
+import torch
 from loguru import logger
 from pydantic import BaseModel
-import torch
 
-from checkpoint_engine.types import BucketRange, H2DBucket, MemoryBuffer, MemoryBufferMetaList, ParameterMeta
 from checkpoint_engine.io import _load_checkpoint
+from checkpoint_engine.types import (
+    BucketRange,
+    H2DBucket,
+    MemoryBuffer,
+    MemoryBufferMetaList,
+    ParameterMeta,
+)
+
+
+if TYPE_CHECKING:
+    T = TypeVar("T")
+
 
 # 256 bytes alignment when flatten torch tensors to uint8 buffer
 _ALIGN_SIZE = 256
@@ -30,6 +44,7 @@ def _to_named_tensor(metas: list[ParameterMeta], offset: int = 0) -> list[dict]:
         )
         offset += size
     return ret
+
 
 def _register_checkpoint(
     *,
@@ -144,10 +159,10 @@ def _gen_h2d_buckets(
 
 
 def _assign_receiver_ranks(
-    buckets: list[tuple[int, "T"]],
+    buckets: list[tuple[int, T]],
     local_topo: dict[str, set[int]],
     remote_topo: dict[str, set[int]],
-) -> list[tuple[int, int, "T"]]:
+) -> list[tuple[int, int, T]]:
     """
     (owner_rank, bucket) -> (receiver_rank, owner_rank, bucket)
 
@@ -199,4 +214,3 @@ def _assign_receiver_ranks(
             assigned_cnt += 1
 
     return buckets_with_receiver
-

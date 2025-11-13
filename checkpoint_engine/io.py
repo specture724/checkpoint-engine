@@ -1,6 +1,6 @@
 import os
 import pickle
-from typing import Any, BinaryIO
+from typing import TYPE_CHECKING, Any, BinaryIO
 
 import numpy as np
 import torch
@@ -9,6 +9,17 @@ from pydantic import BaseModel
 from safetensors import safe_open
 
 from checkpoint_engine.types import ParameterMeta
+
+
+if TYPE_CHECKING:
+    from typing_extensions import TypedDict
+
+    class FileMeta(TypedDict):
+        key: str  # parameter name
+        dtype: torch.dtype
+        shape: torch.Size
+        type: type
+        tp_concat_dim: int
 
 
 def _load_checkpoint_file(file_path: str) -> tuple[int, dict[str, tuple["FileMeta", torch.Tensor]]]:
@@ -110,6 +121,7 @@ def _concat_tp_weights(
     if len(tp_weights) == 1:
         return tp_weights[0]
     return torch.cat([w for w in tp_weights], dim=tp_concat_dim)
+
 
 def _load_checkpoint(files: list[str]) -> dict[str, torch.Tensor]:
     class TPMeta(BaseModel):

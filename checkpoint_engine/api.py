@@ -1,11 +1,13 @@
-
-
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
 import httpx
 from loguru import logger
 from pydantic import BaseModel
 
+
+if TYPE_CHECKING:
+    from checkpoint_engine.ps import ParameterServer
 
 
 def request_inference_to_update(
@@ -37,6 +39,7 @@ def request_inference_to_update(
         timeout=timeout,
     )
     resp.raise_for_status()
+
 
 def _init_api(ps: "ParameterServer") -> Any:
     import fastapi

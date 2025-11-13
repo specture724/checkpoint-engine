@@ -1,15 +1,15 @@
 import argparse
-import uvicorn
 import os
+
+import uvicorn
 from loguru import logger
-from .ps import ParameterServer
+
 from .api import _init_api
+from .ps import ParameterServer
 
 
 @logger.catch(reraise=True)
 def run_from_cli():
-    import uvicorn
-
     parser = argparse.ArgumentParser(description="Parameter Server")
     parser.add_argument("--uds", type=str)
 

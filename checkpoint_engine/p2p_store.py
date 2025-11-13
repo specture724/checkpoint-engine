@@ -5,9 +5,9 @@ import time
 
 import torch
 from loguru import logger
+
 from checkpoint_engine.device_utils import DeviceManager, get_ip, npu_generate_uuid
 
-from checkpoint_engine.types import *
 
 def _get_physical_gpu_id(device_manager: DeviceManager, device_index: int | None = None) -> str:
     try:
@@ -145,12 +145,14 @@ def _resolve_device_specs(
 
     return sorted(devices)
 
+
 def _get_master_port(master_port: int | None = None) -> int:
     if master_port is None:
         # HACK: use MASTER_PORT + 1 as master_port, avoid conflict with torchrun's rendezvous port
         # TODO: check whether master_port is available or use a more elegant way
         master_port = int(os.getenv("MASTER_PORT")) + 1
     return master_port
+
 
 class P2PStore:
     def __init__(self, device_manager: DeviceManager):

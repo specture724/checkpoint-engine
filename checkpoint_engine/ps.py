@@ -1,33 +1,32 @@
-import argparse
-import concurrent.futures
-import ctypes
 import os
-import pickle
-import random
 import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable
 from datetime import timedelta
-from typing import TYPE_CHECKING, Annotated, Any, BinaryIO, NamedTuple
 
-import httpx
-import numpy as np
 import torch
 import torch.distributed as dist
 import zmq
 from loguru import logger
-from pydantic import BaseModel, PlainSerializer, PlainValidator, WithJsonSchema
 from torch.multiprocessing.reductions import reduce_tensor
 
-from checkpoint_engine.api import _init_api
-from checkpoint_engine.device_utils import DeviceManager, get_ip, npu_generate_uuid
-
+from checkpoint_engine.device_utils import DeviceManager, get_ip
+from checkpoint_engine.memory_layout import (
+    _ALIGN_SIZE,
+    _align_size,
+    _gen_h2d_buckets,
+    _register_checkpoint,
+    _to_named_tensor,
+)
 from checkpoint_engine.p2p_store import P2PStore, _get_master_port, _get_physical_gpu_id
-from checkpoint_engine.types import *
-from checkpoint_engine.memory_layout import _align_size, _gen_h2d_buckets, _register_checkpoint, _to_named_tensor, _ALIGN_SIZE
-
-
+from checkpoint_engine.types import (
+    DataToGather,
+    H2DBucket,
+    MemoryBuffer,
+    MemoryBufferMetaList,
+    MemoryBufferMetas,
+)
 
 
 def _get_bcast_rank_map(world_size: int, ranks: list[int] | None) -> dict[int, int]:
@@ -42,8 +41,6 @@ def _get_bcast_rank_map(world_size: int, ranks: list[int] | None) -> dict[int, i
         for i, r in enumerate(ranks):
             bcast_rank_map[r] = i
     return bcast_rank_map
-
-
 
 
 class ParameterServer:
@@ -587,7 +584,3 @@ class ParameterServer:
             self._p2p_store.unregister_named_tensors([h2d_buffer_name])
 
         self.device_manager.device_module.empty_cache()
-
-
-
-
