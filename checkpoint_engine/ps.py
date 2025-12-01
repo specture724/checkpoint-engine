@@ -665,14 +665,23 @@ class P2PStore:
         self.rank = int(os.getenv("RANK"))
         gpu_count = device_manager.device_module.device_count()
         local_rank = self.rank % gpu_count
-        self.device = _get_my_rdma_device(local_rank, gpu_count, _get_rdma_devices())
+        device_type = device_manager.device_type
+        if device_type == "npu" and os.getenv("PS_P2P_STORE_RDMA_DEVICES") is None:
+            self.device = ""
+        else:
+            self.device = _get_my_rdma_device(local_rank, gpu_count, _get_rdma_devices())
         self.ip = get_ip()
 
         # we will start at most 8 ps processes, so we use 8 retries to avoid port conflicts in extreme cases
         retry_count = 8
         for i in range(retry_count):
             self.engine = TransferEngine()
-            ret = self.engine.initialize(self.ip, "P2PHANDSHAKE", "rdma", self.device)
+            ret = self.engine.initialize(
+                self.ip,
+                "P2PHANDSHAKE",
+                "ascend_direct" if device_type == "npu" else "rdma",
+                self.device,
+            )
             if ret == 0:
                 break
             # sleep 0.5 ~ 2.0s, to avoid port conflicts when two processes retry at the same time
@@ -770,14 +779,15 @@ class ParameterServer:
         self._memory_pool: dict[str, list[MemoryBuffer]] = {}
         # dict key is owner_rank, value is a bucket metas list in owner_rank
         self._current_global_parameter_metas: dict[int, MemoryBufferMetaList] = {}
+        # NPU transfer engine initialization requires prior set_device.
+        device_index = self._local_rank
+        self.device_manager.device_module.set_device(device_index)
         try:
             self._p2p_store = P2PStore(self.device_manager)
         except ImportError as e:
             logger.warning(f"[rank{self._rank}] fail to initialize p2p store due to {e}")
             self._p2p_store = None
 
-        device_index = self._local_rank
-        self.device_manager.device_module.set_device(device_index)
         self._device_uuid = _get_physical_gpu_id(self.device_manager, device_index)
         self._rdma_device = None if self._p2p_store is None else self._p2p_store.device
 
@@ -874,6 +884,8 @@ class ParameterServer:
         )
 
         dist.all_gather_object(metas_lst, metas)
+
+        self._current_global_parameter_metas = {}
 
         num_parameters = 0
         all_hosts: list[str] = []
