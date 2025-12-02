@@ -1,6 +1,7 @@
 import argparse
 import concurrent.futures
 import ctypes
+import json
 import os
 import pickle
 import random
@@ -18,7 +19,7 @@ import torch.distributed as dist
 import zmq
 from loguru import logger
 from pydantic import BaseModel, PlainSerializer, PlainValidator, WithJsonSchema
-from safetensors.torch import safe_open
+from safetensors.torch import _getdtype, safe_open
 from torch.multiprocessing.reductions import reduce_tensor
 
 from checkpoint_engine.device_utils import DeviceManager, get_ip, npu_generate_uuid
@@ -460,64 +461,131 @@ def _register_checkpoint(
     )
     if not files and not named_tensors:
         return []
-    parameters = _load_checkpoint(files)
-    if named_tensors:
-        parameters.update(named_tensors)
-    bucket_size = max(4 << 30, max(_align_size(x.dtype, x.shape) for x in parameters.values()))
+    memory_buffers: list[MemoryBuffer] = []
+    inplace_pin = all(
+        file.startswith("/dev/shm/") and file.endswith(".safetensors")  # noqa: S108
+        for file in files or []
+    )
+    if inplace_pin:
 
-    class MemoryBucket(BaseModel):
-        size: int
-        metas: list[ParameterMeta]
+        def _pin(t: torch.Tensor):
+            """
+            Pin the memory of tensor in-place.
+            See: https://github.com/pytorch/pytorch/issues/32167
+            """
+            cudart = torch.cuda.cudart()
+            r = cudart.cudaHostRegister(t.data_ptr(), t.numel() * t.element_size(), 0)
+            assert r == 0, f"pin memory error, error code: {r.value}"
 
-    buckets: list[MemoryBucket] = [MemoryBucket(size=0, metas=[])]
-    for name, tensor in sorted(parameters.items()):
-        size = _align_size(tensor.dtype, tensor.shape)
-        if buckets[-1].size + size > bucket_size:
-            assert buckets[-1], f"buckets[{len(buckets) - 1}] should not be empty"
-            buckets.append(MemoryBucket(size=0, metas=[]))
-        buckets[-1].metas.append(ParameterMeta(name=name, shape=tensor.shape, dtype=tensor.dtype))
-        buckets[-1].size += size
+        def _inplace_pin_memory(file_path: str) -> MemoryBuffer:
+            # TODO: should only support /dev/shm? but we found files in disk also work?
+            size = os.stat(file_path).st_size
+            t = torch.from_file(file_path, True, size, dtype=torch.uint8)
 
-    memory_buffers = [
-        MemoryBuffer(buffer=torch.empty(0), size=bucket.size, metas=bucket.metas)
-        for bucket in buckets
-    ]
+            # safetensors format see https://huggingface.co/docs/safetensors/en/index#format.
+            # We load the safetensors file as bytes, then parse the header manually to get parameter metas.
+            # and the actual tensor data is in the remaining bytes.
+            # We pin the remaining bytes as the buffer, making pinning faster.
+            flag_size = 8
+            with open(file_path, "rb") as f:
+                n = bytearray(flag_size)
+                data = f.readinto(n)
+                assert data == flag_size, f"data {data} should be equal to flag_size {flag_size}"
+                n = int.from_bytes(n, byteorder="little", signed=False)
+                start_pos = n + flag_size
 
-    def register_pin_memory(idx: int, size: int) -> tuple[int, torch.Tensor]:
-        buffer = torch.empty(size, dtype=torch.uint8, pin_memory=True)
-        return idx, buffer
+            time.sleep(3)
+            header_tensor = t[flag_size:start_pos]
+            header = json.loads(header_tensor.numpy().tobytes())
 
-    def register_tensor(buffer: torch.Tensor, offset: int, tensor: torch.Tensor):
-        buffer[offset : offset + tensor.nbytes] = tensor.view(-1).view(dtype=torch.uint8)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
-        futures = [
-            executor.submit(register_pin_memory, idx, bucket.size)
-            for idx, bucket in enumerate(buckets)
-        ]
-        new_futures = []
-        for future in concurrent.futures.as_completed(futures):
-            idx, buffer = future.result()
-            assert buffer.numel() == buckets[idx].size, (
-                f"buffer numel {buffer.numel()} should be equal to bucket size {buckets[idx].size}"
-            )
-            memory_buffers[idx].buffer = buffer
-            logger.info(
-                f"[rank{rank}] register pin_memory for bucket {idx + 1}/{len(buckets)} finished, "
-                f"size {buffer.numel() / 1024 / 1024:.2f}MiB, start to copy tensors to buffer"
-            )
+            metas: list[ParameterMeta] = []
             offset = 0
-            for meta in buckets[idx].metas:
-                name = meta.name
-                tensor = parameters[name]
-                size = _align_size(tensor.dtype, tensor.shape)
-                assert size == _align_size(meta.dtype, meta.shape), (
-                    f"tensor {name} size {size} should be equal to meta size {_align_size(meta.dtype, meta.shape)}"
+            for name, meta in sorted(header.items(), key=lambda x: x[1]["data_offsets"]):
+                start, end = meta["data_offsets"]
+                # safetensors format ensures offsets are aligned
+                assert offset == start, f"offset {offset} should be equal to start {start}"
+                metas.append(
+                    ParameterMeta(
+                        name=name, dtype=_getdtype(meta["dtype"]), shape=torch.Size(meta["shape"])
+                    )
                 )
-                new_futures.append(executor.submit(register_tensor, buffer, offset, tensor))
-                offset += size
-        for future in concurrent.futures.as_completed(new_futures):
-            future.result()
+                offset = end
+
+            buffer = t[start_pos:]
+            assert offset == buffer.nbytes, (
+                f"offset {offset} should be equal to buffer.nbytes {buffer.nbytes}"
+            )
+            _pin(buffer)
+            return MemoryBuffer(buffer=buffer, size=buffer.nbytes, metas=metas)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
+            futures = [executor.submit(_inplace_pin_memory, file) for file in files]
+            for future in concurrent.futures.as_completed(futures):
+                memory_buffer = future.result()
+                memory_buffers.append(memory_buffer)
+
+    else:
+        parameters = _load_checkpoint(files)
+        if named_tensors:
+            parameters.update(named_tensors)
+        bucket_size = max(4 << 30, max(_align_size(x.dtype, x.shape) for x in parameters.values()))
+
+        class MemoryBucket(BaseModel):
+            size: int
+            metas: list[ParameterMeta]
+
+        buckets: list[MemoryBucket] = [MemoryBucket(size=0, metas=[])]
+        for name, tensor in sorted(parameters.items()):
+            size = _align_size(tensor.dtype, tensor.shape)
+            if buckets[-1].size + size > bucket_size:
+                assert buckets[-1], f"buckets[{len(buckets) - 1}] should not be empty"
+                buckets.append(MemoryBucket(size=0, metas=[]))
+            buckets[-1].metas.append(
+                ParameterMeta(name=name, shape=tensor.shape, dtype=tensor.dtype)
+            )
+            buckets[-1].size += size
+
+        memory_buffers = [
+            MemoryBuffer(buffer=torch.empty(0), size=bucket.size, metas=bucket.metas)
+            for bucket in buckets
+        ]
+
+        def register_pin_memory(idx: int, size: int) -> tuple[int, torch.Tensor]:
+            buffer = torch.empty(size, dtype=torch.uint8, pin_memory=True)
+            return idx, buffer
+
+        def register_tensor(buffer: torch.Tensor, offset: int, tensor: torch.Tensor):
+            buffer[offset : offset + tensor.nbytes] = tensor.view(-1).view(dtype=torch.uint8)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
+            futures = [
+                executor.submit(register_pin_memory, idx, bucket.size)
+                for idx, bucket in enumerate(buckets)
+            ]
+            new_futures = []
+            for future in concurrent.futures.as_completed(futures):
+                idx, buffer = future.result()
+                assert buffer.numel() == buckets[idx].size, (
+                    f"buffer numel {buffer.numel()} should be equal to bucket size {buckets[idx].size}"
+                )
+                memory_buffers[idx].buffer = buffer
+                logger.info(
+                    f"[rank{rank}] register pin_memory for bucket {idx + 1}/{len(buckets)} finished, "
+                    f"size {buffer.numel() / 1024 / 1024:.2f}MiB, start to copy tensors to buffer"
+                )
+                offset = 0
+                for meta in buckets[idx].metas:
+                    name = meta.name
+                    tensor = parameters[name]
+                    size = _align_size(tensor.dtype, tensor.shape)
+                    assert size == _align_size(meta.dtype, meta.shape), (
+                        f"tensor {name} size {size} should be equal to meta size {_align_size(meta.dtype, meta.shape)}"
+                    )
+                    new_futures.append(executor.submit(register_tensor, buffer, offset, tensor))
+                    offset += size
+            for future in concurrent.futures.as_completed(new_futures):
+                future.result()
+
     return memory_buffers
 
 
